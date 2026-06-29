@@ -6,6 +6,7 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from utils.train_diagnostics import compute_train_diagnostics
+from utils.wandb_utils import wandb_log, wandb_upload_best_checkpoints
 from torch.utils.tensorboard import SummaryWriter
 from prettytable import PrettyTable
 import numpy as np
@@ -171,12 +172,132 @@ def _loss_components(ret):
     }
 
 
+def _has_prototype_branch(model):
+    model = _unwrap_model(model)
+    return getattr(model, "prototype_branch", None) is not None
+
+
+def _grad_norm_by_loss(losses, model):
+    params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
+    norms = {}
+    if not params:
+        return norms
+
+    for name, loss in losses.items():
+        if not loss.requires_grad:
+            norms[f"{name}_grad_norm"] = 0.0
+            continue
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+        grad_sq_sum = loss.new_zeros(())
+        has_grad = False
+        for grad in grads:
+            if grad is None:
+                continue
+            has_grad = True
+            grad_sq_sum = grad_sq_sum + grad.detach().float().pow(2).sum()
+        norms[f"{name}_grad_norm"] = grad_sq_sum.sqrt().item() if has_grad else 0.0
+    return norms
+
+
 def _update_meter(meters, key, value, batch_size):
     if key not in meters:
         meters[key] = AverageMeter()
     if torch.is_tensor(value):
         value = value.detach().item()
     meters[key].update(value, batch_size)
+
+
+def _best_val_wandb_metrics(best_metrics):
+    metrics = {}
+    for key in ("R1", "R5", "R10", "mAP", "mINP", "rSum"):
+        if key in best_metrics:
+            metrics[f"val/best_row/{key}"] = best_metrics[key]
+    if best_metrics.get("task"):
+        metrics["val/best_row_task"] = best_metrics["task"]
+    return metrics
+
+
+def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps):
+    metrics = {
+        "train/epoch": epoch,
+        "train/iteration": current_steps,
+        "train/total_loss": meters["loss"].avg,
+        "train/weighted_loss": meters["loss"].avg,
+        "train/lr": optimizer.param_groups[0]["lr"],
+    }
+    lrs = [group["lr"] for group in optimizer.param_groups]
+    metrics["train/lr_min"] = min(lrs)
+    metrics["train/lr_max"] = max(lrs)
+
+    for loss_key in loss_components.keys():
+        if loss_key in meters and meters[loss_key].count > 0:
+            metrics[f"train/weighted_loss/{loss_key}"] = meters[loss_key].avg
+
+    for key, meter in meters.items():
+        if key.endswith("_grad_norm") and meter.count > 0:
+            loss_name = key[: -len("_grad_norm")]
+            metrics[f"train/loss_grad_norm/{loss_name}"] = meter.avg
+
+    for key in ("img_acc", "txt_acc", "mlm_acc"):
+        if key in meters and meters[key].count > 0:
+            metrics[f"train/{key}"] = meters[key].avg
+
+    dashboard_keys = [
+        "host_margin_mean",
+        "host_margin_p10",
+        "hard_pos_margin_mean",
+        "negative_intrusion_rate",
+        "mean_first_positive_rank",
+        "host_intra_i2i_sim_mean",
+        "host_intra_t2t_sim_mean",
+        "host_intra_xmod_sim_mean",
+        "host_paired_xmod_sim_mean",
+        "host_inter_i2i_nearest_sim_mean",
+        "host_inter_t2t_nearest_sim_mean",
+        "host_inter_xmod_nearest_sim_mean",
+        "host_i2i_identity_margin_mean",
+        "host_t2t_identity_margin_mean",
+        "host_xmod_identity_margin_mean",
+        "host_topk_neg_attr_sim_mean",
+        "host_topk_neg_identity_centroid_sim_mean",
+        "host_topk_neg_identity_centroid_distance_mean",
+        "host_topk_attr_id_decoupling",
+        "host_same_id_alignment_gap",
+        "host_identity_centroid_nearest_sim_mean",
+        "host_identity_centroid_margin_mean",
+        "proto_margin_img_mean",
+        "proto_margin_txt_mean",
+        "negative_proto_margin_rate",
+        "dead_slot_rate",
+        "effective_slots_per_id",
+        "effective_prototypes",
+        "soft_assignment_entropy",
+        "soft_assignment_peak",
+        "slot_redundancy",
+        "assignment_flip_rate",
+        "hard_negative_overlap",
+        "proto_to_host_margin_corr",
+    ]
+    for key in dashboard_keys:
+        if key in meters and meters[key].count > 0:
+            metrics[f"train/{key}"] = meters[key].avg
+    return metrics
+
+
+def _train_console_metrics(loss_components):
+    keys = ["loss"]
+    for loss_key in loss_components.keys():
+        keys.append(loss_key)
+        keys.append(f"{loss_key}_grad_norm")
+    return keys
+
+
+def _should_run_initial_eval(start_epoch, eval_after_epoch):
+    return (start_epoch - 1) >= eval_after_epoch
+
+
+def _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
+    return epoch >= eval_after_epoch and epoch % eval_period == 0
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
@@ -188,6 +309,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     arguments = {}
     arguments["num_epoch"] = num_epoch
     arguments["iteration"] = 0
+    arguments["epoch"] = start_epoch - 1
 
     logger = logging.getLogger("dm-adapter.train")
     logger.info('start training')
@@ -212,7 +334,21 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
+    eval_after_epoch = max(int(getattr(args, "eval_after_epoch", 0)), 0)
+    if _should_run_initial_eval(start_epoch, eval_after_epoch):
+        eval_model = model.module.eval() if getattr(args, "distributed", False) else model.eval()
+        initial_eval = evaluator.eval(eval_model, return_metrics=(get_rank() == 0))
+        if get_rank() == 0 and isinstance(initial_eval, tuple):
+            initial_top1, _, initial_best_metrics = initial_eval
+            wandb_metrics = {
+                "val/epoch": start_epoch - 1,
+                "val/top1": initial_top1,
+            }
+            wandb_metrics.update(_best_val_wandb_metrics(initial_best_metrics))
+            wandb_log(wandb_metrics, step=0)
+
     train_diag_state = {"assignments": {}}
+    current_steps = 0
 
     # train
     for epoch in range(start_epoch, num_epoch + 1):
@@ -226,6 +362,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         model.train()
 
         for n_iter, batch in enumerate(train_loader):
+            current_steps += 1
             batch = {k: v.to(device) for k, v in batch.items()}
 
             ret = model(batch)
@@ -243,6 +380,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     _update_meter(meters, metric_key, ret[metric_key], batch_size)
 
             if (n_iter + 1) % log_period == 0:
+                grad_norms = _grad_norm_by_loss(loss_components, model)
+                for grad_key, grad_norm in grad_norms.items():
+                    _update_meter(meters, grad_key, grad_norm, batch_size)
                 train_diag_metrics = compute_train_diagnostics(model, ret, args, train_diag_state)
                 for diag_key, diag_value in train_diag_metrics.items():
                     _update_meter(meters, diag_key, diag_value, batch_size)
@@ -255,11 +395,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if (n_iter + 1) % log_period == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 # log loss and acc info
-                for k, v in meters.items():
-                    if v.count > 0:
+                for k in _train_console_metrics(loss_components):
+                    v = meters.get(k)
+                    if v is not None and v.count > 0:
                         info_str += f", {k}: {v.avg:.4f}"
-                info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
+                info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
+                if get_rank() == 0:
+                    wandb_log(_train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps),
+                              step=current_steps)
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
@@ -275,21 +419,41 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                 .format(epoch, time_per_batch,
                         train_loader.batch_size / time_per_batch))
-        if epoch % eval_period == 0:
+        if _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 if args.distributed:
-                    top1 = evaluator.eval(model.module.eval())
+                    top1, _, best_val_metrics = evaluator.eval(model.module.eval(), return_metrics=True)
                 else:
-                    top1 = evaluator.eval(model.eval())
+                    top1, _, best_val_metrics = evaluator.eval(model.eval(), return_metrics=True)
 
+                wandb_metrics = {
+                    "val/epoch": epoch,
+                    "val/top1": top1,
+                    "val/best_top1": max(best_top1, top1),
+                }
+                wandb_metrics.update(_best_val_wandb_metrics(best_val_metrics))
+                wandb_log(wandb_metrics, step=current_steps)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1
                     arguments["epoch"] = epoch
-                    # checkpointer.save("best", **arguments)
+                    checkpointer.save("best", **arguments)
+                    if _has_prototype_branch(model):
+                        if hasattr(checkpointer, "save_prototype_branch"):
+                            checkpointer.save_prototype_branch("best_prototype_branch", **arguments)
+                        if hasattr(checkpointer, "save_prototype_bank"):
+                            checkpointer.save_prototype_bank("best_prototype_bank", **arguments)
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+        wandb_upload_best_checkpoints(
+            args.output_dir,
+            logger=logger,
+            metadata={
+                "best_top1": float(best_top1),
+                "best_epoch": int(arguments["epoch"]),
+            },
+        )
     nvmlShutdown()
 
 

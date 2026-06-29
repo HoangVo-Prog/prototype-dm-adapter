@@ -55,7 +55,7 @@ class Evaluator():
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
             with torch.no_grad():
-                text_feat = model.encode_text(caption, l_aux=0)
+                text_feat = model.encode_text(caption, l_aux=0).cpu()
             qids.append(pid.view(-1))  # flatten
             qfeats.append(text_feat)
         qids = torch.cat(qids, 0)
@@ -65,7 +65,7 @@ class Evaluator():
         for pid, img in self.img_loader:
             img = img.to(device)
             with torch.no_grad():
-                img_feat = model.encode_image(img, l_aux=0)
+                img_feat = model.encode_image(img, l_aux=0).cpu()
             gids.append(pid.view(-1))  # flatten
             gfeats.append(img_feat)
         gids = torch.cat(gids, 0)
@@ -73,7 +73,7 @@ class Evaluator():
 
         return qfeats, gfeats, qids, gids
 
-    def eval(self, model, i2t_metric=False):
+    def eval(self, model, i2t_metric=False, return_metrics=False):
 
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
 
@@ -84,20 +84,52 @@ class Evaluator():
 
         t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)
         t2i_cmc, t2i_mAP, t2i_mINP = t2i_cmc.numpy(), t2i_mAP.numpy(), t2i_mINP.numpy()
-        table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP"])
-        table.add_row(['t2i', t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP])
+        t2i_rsum = t2i_cmc[0] + t2i_cmc[4] + t2i_cmc[9]
+        table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP", "rSum"])
+        table.add_row(['t2i', t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_rsum])
+        top1 = float(t2i_cmc[0])
+        metrics = {
+            "t2i/R1": float(t2i_cmc[0]),
+            "t2i/R5": float(t2i_cmc[4]),
+            "t2i/R10": float(t2i_cmc[9]),
+            "t2i/mAP": float(t2i_mAP),
+            "t2i/mINP": float(t2i_mINP),
+            "t2i/rSum": float(t2i_rsum),
+        }
+        best_metrics = {
+            "task": "t2i",
+            "R1": float(t2i_cmc[0]),
+            "R5": float(t2i_cmc[4]),
+            "R10": float(t2i_cmc[9]),
+            "mAP": float(t2i_mAP),
+            "mINP": float(t2i_mINP),
+            "rSum": float(t2i_rsum),
+        }
 
         if i2t_metric:
             i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=similarity.t(), q_pids=gids, g_pids=qids, max_rank=10,
                                                  get_mAP=True)
             i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-            table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
+            i2t_rsum = i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]
+            table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_rsum])
+            metrics.update({
+                "i2t/R1": float(i2t_cmc[0]),
+                "i2t/R5": float(i2t_cmc[4]),
+                "i2t/R10": float(i2t_cmc[9]),
+                "i2t/mAP": float(i2t_mAP),
+                "i2t/mINP": float(i2t_mINP),
+                "i2t/rSum": float(i2t_rsum),
+            })
         # table.float_format = '.4'
-        table.custom_format["R1"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R5"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R10"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mAP"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mINP"] = lambda f, v: f"{v:.3f}"
+        table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["R5"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["mAP"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
+        self.logger.info('\n' + "best R1 = " + str(top1))
 
-        return t2i_cmc[0]
+        if return_metrics:
+            return top1, metrics, best_metrics
+        return top1

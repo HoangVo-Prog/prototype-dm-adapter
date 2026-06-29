@@ -16,6 +16,7 @@ from model import build_model
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
+from utils.wandb_utils import setup_wandb, wandb_finish
 
 
 def set_seed(seed=0):
@@ -27,16 +28,51 @@ def set_seed(seed=0):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
-def get_parameter(model):
-    trainable = 0.0
-    total = 0.0
-    for name, param in model.named_parameters():
-        total += param.numel()
-        if param.requires_grad:
-            print(name)
-            trainable += param.numel()
-    print("Total Param: {:.2f}M".format(total//1e6), "Trainable Param: {:.2f} M".format(trainable//1e6) )
-    print("Total Param: {:.2f}".format(total), "Trainable Param: {:.2f} ".format(trainable) )
+def _count_parameters(module, trainable_only=False):
+    return sum(
+        p.numel()
+        for p in module.parameters()
+        if not trainable_only or p.requires_grad
+    )
+
+
+def _count_buffers(module):
+    return sum(buffer.numel() for buffer in module.buffers())
+
+
+def log_model_parameter_counts(model, logger):
+    total_params = _count_parameters(model)
+    trainable_params = _count_parameters(model, trainable_only=True)
+    logger.info('Total params: %2.fM' % (total_params / 1000000.0))
+    logger.info(
+        "Trainable params: %d total (%.4fM), %.2f%% of total model params",
+        trainable_params,
+        trainable_params / 1000000.0,
+        (trainable_params / total_params * 100.0) if total_params else 0.0,
+    )
+
+    prototype_branch = getattr(model, "prototype_branch", None)
+    if prototype_branch is None:
+        logger.info("Prototype branch params: disabled")
+        return
+
+    prototype_params = _count_parameters(prototype_branch)
+    prototype_trainable_params = _count_parameters(prototype_branch, trainable_only=True)
+    prototype_buffer_elements = _count_buffers(prototype_branch)
+    prototype_share = (prototype_params / total_params * 100.0) if total_params else 0.0
+    logger.info(
+        "Prototype branch params: %d total (%.4fM), %d trainable (%.4fM), %.2f%% of total model params",
+        prototype_params,
+        prototype_params / 1000000.0,
+        prototype_trainable_params,
+        prototype_trainable_params / 1000000.0,
+        prototype_share,
+    )
+    logger.info(
+        "Prototype branch buffers: %d elements (%.4fM, not counted as params)",
+        prototype_buffer_elements,
+        prototype_buffer_elements / 1000000.0,
+    )
     
 if __name__ == '__main__':
 
@@ -53,18 +89,17 @@ if __name__ == '__main__':
         synchronize()
     
     device = "cuda"
-    cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    cur_time = args.run_time or time.strftime("%Y%m%d_%H%M%S", time.localtime())
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}')
-    logger = setup_logger('IRRA', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
+    logger = setup_logger('dm-adapter', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
+    wandb_run = setup_wandb(args, cur_time, logger)
 
     # get image-text pair datasets dataloader
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes)
-
-    logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
 
     model.to(device)
     
@@ -93,17 +128,14 @@ if __name__ == '__main__':
     # Double check
     enabled = set()
     disabled = set()
-    for name, param in model.named_parameters():
+    for param_name, param in model.named_parameters():
         if param.requires_grad:
-            enabled.add(name)
+            enabled.add(param_name)
         else:
-            disabled.add(name)
-    print(f"Parameters to be updated: {enabled}")
-    print(f"-----" * 30)
-    print(f"Parameters not to be updated: {disabled}")
-    
-    #### output parameter
-    get_parameter(model)
+            disabled.add(param_name)
+    logger.info("Parameters to be updated: %d tensors", len(enabled))
+    logger.info("Parameters not to be updated: %d tensors", len(disabled))
+    log_model_parameter_counts(model, logger)
     
     optimizer = build_optimizer(args, model)
     scheduler = build_lr_scheduler(args, optimizer)
@@ -112,15 +144,13 @@ if __name__ == '__main__':
     checkpointer = Checkpointer(model, optimizer, scheduler, args.output_dir, is_master)
     evaluator = Evaluator(val_img_loader, val_txt_loader)
 
-    start_time = time.time()
-    top1 = evaluator.eval(model.eval())
-    end_time = time.time()
-    logger.info( "test done. Time: {:.3f}[s]".format(end_time-start_time))
-
     start_epoch = 1
     if args.resume:
         checkpoint = checkpointer.resume(args.resume_ckpt_file)
         start_epoch = checkpoint['epoch']
 
-
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    try:
+        do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    finally:
+        if wandb_run is not None:
+            wandb_finish()
