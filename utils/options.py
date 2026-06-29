@@ -7,6 +7,8 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--name", default="irra_test", help="experiment name to save")
     parser.add_argument("--output_dir", default="logs")
+    parser.add_argument("--seed", default=1, type=int,
+                        help="base random seed for training, data loading, and prototype initialization")
     parser.add_argument("--log_period", default=100)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test")  # use val set when evaluate, if test use test set
@@ -36,6 +38,37 @@ def get_args():
     parser.add_argument("--mlm_loss_weight", type=float, default=1.0, help="mlm loss weight")
     parser.add_argument("--id_loss_weight", type=float, default=1.0, help="id loss weight")
 
+    ######################## prototype settings ########################
+    parser.add_argument("--prototype", default=False, action='store_true',
+                        help="build the plug-and-play prototype branch")
+    parser.add_argument("--use_loss_id", default=False, action='store_true',
+                        help="add the prototype identity regularizer to the training loss")
+    parser.add_argument("--no_pbt", default=False, action='store_true',
+                        help="use raw cross-modal prototype banks instead of translated PBT banks")
+    parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "global"],
+                        help="prototype feature source; auto is the host global retrieval embedding")
+    parser.add_argument("--prototype_projector", type=str, default="default",
+                        choices=[
+                            "default",
+                            "identity",
+                            "residual_identity",
+                            "random_orthogonal",
+                            "pca_init",
+                            "shared",
+                            "shared_pca_init",
+                        ],
+                        help="prototype projection mode")
+    parser.add_argument("--prototype_residual_scale", type=float, default=0.1,
+                        help="scale for --prototype_projector residual_identity")
+    parser.add_argument("--prototype_per_id", type=int, default=2)
+    parser.add_argument("--prototype_dim", type=int, default=512)
+    parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
+    parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
+    parser.add_argument("--prototype_tau", type=float, default=0.05)
+    parser.add_argument("--prototype_hard_k", type=int, default=16)
+    parser.add_argument("--prototype_id_weight", type=float, default=0.2)
+    parser.add_argument("--prototype_momentum", type=float, default=0.2)
+
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)
@@ -47,6 +80,8 @@ def get_args():
     ######################## solver ########################
     parser.add_argument("--optimizer", type=str, default="Adam", help="[SGD, Adam, Adamw]")
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--prototype_lr", type=float, default=None,
+                        help="absolute learning rate for prototype_branch; defaults to lr * lr_factor")
     parser.add_argument("--bias_lr_factor", type=float, default=2.)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=4e-5)

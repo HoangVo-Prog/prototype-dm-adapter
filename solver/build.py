@@ -5,8 +5,12 @@ from .lr_scheduler import LRSchedulerWithWarmup
 
 def build_optimizer(args, model):
     params = []
+    prototype_lr = getattr(args, "prototype_lr", None)
+    if prototype_lr is None:
+        prototype_lr = args.lr * args.lr_factor
 
     print(f'Using {args.lr_factor} times learning rate for random init module ')
+    print(f'Using {prototype_lr} learning rate for prototype branch ')
     
     for key, value in model.named_parameters():
         if not value.requires_grad:
@@ -22,6 +26,8 @@ def build_optimizer(args, model):
             weight_decay = args.weight_decay_bias
         if "classifier" in key or "mlm_head" in key:
             lr = args.lr * args.lr_factor
+        if "prototype_branch" in key:
+            lr = prototype_lr
         
         params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
 

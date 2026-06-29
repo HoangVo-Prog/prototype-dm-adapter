@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 import math
+from .prototype import PrototypeBranch
     
 class IRRA(nn.Module):
     def __init__(self, args, num_classes=11003):
@@ -16,6 +17,10 @@ class IRRA(nn.Module):
         self.base_model, base_cfg, state_dict = build_CLIP_from_openai_pretrained(args.pretrain_choice, args.img_size, args.stride_size, args.num_experts, args.topk, args.reduction)
 
         self.embed_dim = base_cfg['embed_dim']
+        self.prototype_enabled = (
+            getattr(args, "prototype", False)
+            or getattr(args, "use_loss_id", False)
+        )
 
         # new add vs V5
         self.apply(self.init_weights) # random init must before loading pretrain
@@ -78,6 +83,16 @@ class IRRA(nn.Module):
                 nn.init.zeros_(self.base_model.transformer.resblocks[i].feed_forward.experts[j].down.bias)
                 nn.init.zeros_(self.base_model.transformer.resblocks[i].feed_forward.experts[j].up.weight)
                 nn.init.zeros_(self.base_model.transformer.resblocks[i].feed_forward.experts[j].up.bias)
+
+        if self.prototype_enabled:
+            self.prototype_branch = PrototypeBranch(
+                args=args,
+                num_classes=num_classes,
+                image_dim=self.embed_dim,
+                text_dim=self.embed_dim,
+            )
+        else:
+            self.prototype_branch = None
                 
     def init_weights(self, module):
         """ Initialize the weights.
@@ -98,7 +113,7 @@ class IRRA(nn.Module):
 
     def _set_task(self):
         loss_names = self.args.loss_names
-        self.current_task = [l.strip() for l in loss_names.split('+')]
+        self.current_task = [l.strip() for l in loss_names.split('+') if l.strip() and l.strip() != 'proto']
         print(f'Training Model with {self.current_task} tasks')
     
     
@@ -126,18 +141,38 @@ class IRRA(nn.Module):
         x = outputs[0]
         return x[torch.arange(x.shape[0]), text.argmax(dim=-1)].float()
 
+    def _compute_host_embeddings(self, images, caption_ids):
+        image_feats, text_feats, l_aux = self.base_model(images, caption_ids)
+        i_feats = image_feats[:, 0, :].float()
+        t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+        return {
+            "image_tokens": image_feats,
+            "text_tokens": text_feats,
+            "i_feats": i_feats,
+            "t_feats": t_feats,
+            "l_aux": l_aux,
+        }
+
+    def select_prototype_features(self, outputs, batch):
+        return outputs["i_feats"], outputs["t_feats"]
+
+    @torch.no_grad()
+    def extract_prototype_features(self, batch):
+        outputs = self._compute_host_embeddings(batch['images'], batch['caption_ids'])
+        return self.select_prototype_features(outputs, batch)
+
     def forward(self, batch):
         ret = dict()
 
         images = batch['images']
         caption_ids = batch['caption_ids']
-        image_feats, text_feats, l_aux = self.base_model(images, caption_ids)
-        i_feats = image_feats[:, 0, :].float()
+        outputs = self._compute_host_embeddings(images, caption_ids)
+        image_feats = outputs["image_tokens"]
+        i_feats = outputs["i_feats"]
         # i_feats = image_feats.float() # for CLIP ResNet visual model
-
-
-        # todo
-        t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+        text_feats = outputs["text_tokens"]
+        t_feats = outputs["t_feats"]
+        l_aux = outputs["l_aux"]
 
         logit_scale = self.logit_scale
         ret.update({'temperature': 1 / logit_scale})
@@ -201,6 +236,25 @@ class IRRA(nn.Module):
             mlm_label_idx = torch.nonzero(mlm_labels)
             acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
             ret.update({'mlm_acc': acc})
+
+        if self.prototype_enabled and self.prototype_branch is not None:
+            proto_image_feats, proto_text_feats = self.select_prototype_features(outputs, batch)
+            ret["_diag"] = {
+                "host_image_feats": i_feats.detach(),
+                "host_text_feats": t_feats.detach(),
+                "proto_image_feats": proto_image_feats.detach(),
+                "proto_text_feats": proto_text_feats.detach(),
+                "pids": batch["pids"].detach(),
+                "indices": batch.get("index", None),
+            }
+            proto_ret = self.prototype_branch(
+                proto_image_feats,
+                proto_text_feats,
+                batch['pids'],
+                use_loss_id=getattr(self.args, "use_loss_id", False),
+            )
+            if "proto_id_loss" in proto_ret:
+                ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)
 
         return ret
 
