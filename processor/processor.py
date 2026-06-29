@@ -11,7 +11,6 @@ from torch.utils.tensorboard import SummaryWriter
 from prettytable import PrettyTable
 import numpy as np
 import copy
-from pynvml import *
 from datasets.bases import ImageTextDataset
 from datasets.build import build_transforms, collate
 
@@ -454,7 +453,6 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 "best_epoch": int(arguments["epoch"]),
             },
         )
-    nvmlShutdown()
 
 
 
