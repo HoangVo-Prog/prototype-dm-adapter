@@ -1,4 +1,5 @@
 import logging
+import numbers
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
@@ -59,7 +60,7 @@ def collate(batch):
 
     batch_tensor_dict = {}
     for k, v in dict_batch.items():
-        if isinstance(v[0], int):
+        if isinstance(v[0], numbers.Integral):
             batch_tensor_dict.update({k: torch.tensor(v)})
         elif torch.is_tensor(v[0]):
              batch_tensor_dict.update({k: torch.stack(v)})
