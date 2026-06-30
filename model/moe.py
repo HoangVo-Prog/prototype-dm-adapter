@@ -29,6 +29,8 @@ class MoeLayer(nn.Module):
         
         gate_logits = (1-self.alpha) * input_gate_logits + self.alpha *  task_gate_logits
         
+        # Deterministic runtime makes top-k repeatable for fixed logits; exact cross-GPU
+        # equality is still limited when fp16 gate logits are tied or nearly tied.
         weights, selected_experts = torch.topk(
             gate_logits, self.args.num_experts_per_tok
         )

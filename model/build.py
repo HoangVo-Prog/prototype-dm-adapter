@@ -261,6 +261,7 @@ class IRRA(nn.Module):
 
 def build_model(args, num_classes=11003):
     model = IRRA(args, num_classes)
-    # covert model to fp16
+    # Keep the original fp16 conversion path; deterministic mode controls CUDA kernels,
+    # but near-tied fp16 decisions may still differ across GPU architectures.
     convert_weights(model)
     return model

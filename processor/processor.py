@@ -1,6 +1,8 @@
 import logging
 import time
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
@@ -12,7 +14,7 @@ from prettytable import PrettyTable
 import numpy as np
 import copy
 from datasets.bases import ImageTextDataset
-from datasets.build import build_transforms, collate
+from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
 
 
 def _unwrap_model(model):
@@ -43,6 +45,25 @@ def _set_epoch_on_loader(loader, epoch):
         inner_sampler.set_epoch(epoch)
 
 
+@torch.no_grad()
+def _sync_prototype_memory(model):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    model = _unwrap_model(model)
+    branch = getattr(model, "prototype_branch", None)
+    memory = getattr(branch, "memory", None) if branch is not None else None
+    if memory is None or not getattr(memory, "is_ready", lambda: False)():
+        return
+
+    world_size = dist.get_world_size()
+    for name in ("image_prototypes", "text_prototypes", "text_to_image", "image_to_text"):
+        buffer = getattr(memory, name, None)
+        if torch.is_tensor(buffer):
+            dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
+            buffer.div_(world_size)
+            buffer.copy_(F.normalize(buffer, p=2, dim=1))
+
+
 def _build_prototype_init_loader(train_loader, args):
     train_set = getattr(train_loader, "dataset", None)
     source_dataset = getattr(train_set, "dataset", None)
@@ -62,6 +83,8 @@ def _build_prototype_init_loader(train_loader, args):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=5000),
     )
 
 
@@ -159,6 +182,7 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         getattr(args, "test_batch_size", getattr(args, "batch_size", 512)),
     )
     branch.initialize_projected(image_features, text_features, pids)
+    _sync_prototype_memory(model)
     logger.info("Prototype banks initialized with %d samples", pids.numel())
     synchronize()
 
@@ -389,6 +413,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            _sync_prototype_memory(model)
             synchronize()
 
             if (n_iter + 1) % log_period == 0:
@@ -417,7 +442,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             logger.info(
                 "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                 .format(epoch, time_per_batch,
-                        train_loader.batch_size / time_per_batch))
+                        batch_size / time_per_batch))
         if _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))

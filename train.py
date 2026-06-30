@@ -19,14 +19,51 @@ from utils.comm import get_rank, synchronize
 from utils.wandb_utils import setup_wandb, wandb_finish
 
 
-def set_seed(seed=0):
+def set_seed(seed=0, deterministic=False):
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+    else:
+        # Preserve the historical dm-adapter runtime behavior unless deterministic mode is requested.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(False, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(False)
+
+
+def log_reproducibility_settings(logger, args, effective_seed):
+    matmul_tf32 = None
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = getattr(torch.backends.cudnn, "allow_tf32", None)
+    deterministic_algorithms = None
+    if hasattr(torch, "are_deterministic_algorithms_enabled"):
+        deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
+    logger.info("Seed: base=%d, rank=%d, effective=%d", args.seed, get_rank(), effective_seed)
+    logger.info("Deterministic mode: %s", "enabled" if args.deterministic else "disabled")
+    logger.info("cuDNN deterministic: %s", torch.backends.cudnn.deterministic)
+    logger.info("cuDNN benchmark: %s", torch.backends.cudnn.benchmark)
+    logger.info("TF32 matmul: %s, TF32 cuDNN: %s", matmul_tf32, cudnn_tf32)
+    logger.info("torch deterministic algorithms: %s", deterministic_algorithms)
 
 def _count_parameters(module, trainable_only=False):
     return sum(
@@ -77,7 +114,8 @@ def log_model_parameter_counts(model, logger):
 if __name__ == '__main__':
 
     args = get_args()
-    set_seed(args.seed + get_rank())
+    effective_seed = args.seed + get_rank()
+    set_seed(effective_seed, deterministic=args.deterministic)
     name = args.name
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -93,6 +131,7 @@ if __name__ == '__main__':
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}')
     logger = setup_logger('dm-adapter', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
+    log_reproducibility_settings(logger, args, effective_seed)
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
     wandb_run = setup_wandb(args, cur_time, logger)

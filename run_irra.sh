@@ -9,6 +9,8 @@ python train.py \
 --name baseline \
 --img_aug \
 --batch_size 128 \
+--seed 1 \
+--deterministic \
 --MLM \
 --dataset_name $DATASET_NAME \
 --loss_names 'sdm+aux' \
@@ -18,4 +20,3 @@ python train.py \
 --num_experts 6 \
 --topk 2 \
 --reduction 8
-

@@ -13,6 +13,7 @@ from model import build_model
 from utils.metrics import Evaluator
 import argparse
 from utils.iotools import load_train_configs
+from train import log_reproducibility_settings, set_seed
 
 
 if __name__ == '__main__':
@@ -20,9 +21,16 @@ if __name__ == '__main__':
     parser.add_argument("--config_file", default='../logs/CUHK-PEDES/20240810_110716_baseline/configs.yaml')
     args = parser.parse_args()
     args = load_train_configs(args.config_file)
+    if not hasattr(args, "seed"):
+        args.seed = 1
+    if not hasattr(args, "deterministic"):
+        args.deterministic = False
+    effective_seed = args.seed
+    set_seed(effective_seed, deterministic=args.deterministic)
 
     args.training = False
     logger = setup_logger('dm-adapter', save_dir=args.output_dir, if_train=args.training)
+    log_reproducibility_settings(logger, args, effective_seed)
     logger.info(args)
     device = "cuda"
 

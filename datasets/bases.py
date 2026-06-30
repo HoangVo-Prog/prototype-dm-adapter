@@ -157,7 +157,10 @@ class ImageTextMLMDataset(Dataset):
         caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length,
                                   truncate=self.truncate)
 
-        mlm_tokens, mlm_labels = self._build_random_masked_tokens_and_labels(caption_tokens.cpu().numpy())
+        mlm_tokens, mlm_labels = self._build_random_masked_tokens_and_labels(
+            caption_tokens.cpu().numpy(),
+            rng=random.Random(torch.initial_seed() + int(index)),
+        )
 
         ret = {
             'pids': pid,
@@ -171,7 +174,7 @@ class ImageTextMLMDataset(Dataset):
 
         return ret
 
-    def _build_random_masked_tokens_and_labels(self, tokens):
+    def _build_random_masked_tokens_and_labels(self, tokens, rng):
         """
         Masking some random tokens for Language Model task with probabilities as in the original BERT paper.
         :param tokens: list of int, tokenized sentence.
@@ -183,7 +186,7 @@ class ImageTextMLMDataset(Dataset):
         labels = []
         for i, token in enumerate(tokens):
             if 0 < token < 49405:
-                prob = random.random()
+                prob = rng.random()
                 # mask token with 15% probability
                 mask_ratio = 0.15   #0.15
                 if prob < mask_ratio:
@@ -195,7 +198,7 @@ class ImageTextMLMDataset(Dataset):
 
                     # 10% randomly change token to random token
                     elif prob < 0.9:
-                        tokens[i] = random.choice(token_range)
+                        tokens[i] = rng.choice(token_range)
 
                     # -> rest 10% randomly keep current token
 
