@@ -144,7 +144,7 @@ a new codebase.
 | `--prototype_per_id` | Number of prototype slots per train identity. |
 | `--prototype_dim` | Dimension of the shared prototype space. |
 | `--prototype_kmeans_iters` | Spherical K-Means iterations during initialization. |
-| `--prototype_warmup_epochs` | Initialize when `epoch > prototype_warmup_epochs`. |
+| `--prototype_warmup_epochs` | For positive values, initialize after that epoch's evaluation; `5` enables prototypes for epoch 6 training. |
 | `--prototype_tau` | Temperature for prototype identity loss. |
 | `--prototype_hard_k` | Number of hard wrong-identity prototype rows used in the negative term. |
 | `--prototype_id_weight` | Weight applied once to `proto_id_loss` before host loss aggregation. |
@@ -296,7 +296,15 @@ Initialize prototype memory once after warmup:
 
 ```python
 if prototype_requested(args):
-    if epoch > args.prototype_warmup_epochs and not prototype_ready(model):
+    if args.prototype_warmup_epochs <= 0 and epoch > args.prototype_warmup_epochs and not prototype_ready(model):
+        maybe_initialize_prototypes(...)
+
+...
+
+run_validation_if_due(...)
+
+if prototype_requested(args):
+    if args.prototype_warmup_epochs > 0 and epoch >= args.prototype_warmup_epochs and not prototype_ready(model):
         maybe_initialize_prototypes(...)
 ```
 
@@ -894,7 +902,13 @@ Minimal training-loop hook:
 
 ```python
 if args.prototype or args.use_loss_id:
-    if epoch > args.prototype_warmup_epochs and not prototype_ready(model):
+    if args.prototype_warmup_epochs <= 0 and epoch > args.prototype_warmup_epochs and not prototype_ready(model):
+        maybe_initialize_prototypes(model, train_loader, args, device, logger)
+
+run_validation_if_due(...)
+
+if args.prototype or args.use_loss_id:
+    if args.prototype_warmup_epochs > 0 and epoch >= args.prototype_warmup_epochs and not prototype_ready(model):
         maybe_initialize_prototypes(model, train_loader, args, device, logger)
 ```
 

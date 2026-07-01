@@ -34,6 +34,18 @@ def _prototype_ready(model):
     return branch is not None and branch.is_ready()
 
 
+def _prototype_warmup_epochs(args):
+    return max(int(getattr(args, "prototype_warmup_epochs", 0)), 0)
+
+
+def _should_initialize_prototypes_before_epoch(epoch, prototype_warmup_epochs):
+    return prototype_warmup_epochs <= 0 and epoch > prototype_warmup_epochs
+
+
+def _should_initialize_prototypes_after_epoch(epoch, prototype_warmup_epochs):
+    return prototype_warmup_epochs > 0 and epoch >= prototype_warmup_epochs
+
+
 def _set_epoch_on_loader(loader, epoch):
     sampler = getattr(loader, "sampler", None)
     if sampler is not None and hasattr(sampler, "set_epoch"):
@@ -358,6 +370,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     best_top1 = 0.0
     eval_after_epoch = max(int(getattr(args, "eval_after_epoch", 0)), 0)
+    prototype_warmup_epochs = _prototype_warmup_epochs(args)
     if _should_run_initial_eval(start_epoch, eval_after_epoch):
         eval_model = model.module.eval() if getattr(args, "distributed", False) else model.eval()
         initial_eval = evaluator.eval(eval_model, return_metrics=(get_rank() == 0))
@@ -380,7 +393,10 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meter.reset()
         _set_epoch_on_loader(train_loader, epoch)
         if _prototype_requested(args):
-            if epoch > getattr(args, "prototype_warmup_epochs", 0) and not _prototype_ready(model):
+            if (
+                _should_initialize_prototypes_before_epoch(epoch, prototype_warmup_epochs)
+                and not _prototype_ready(model)
+            ):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)
         model.train()
 
@@ -468,6 +484,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                             checkpointer.save_prototype_branch("best_prototype_branch", **arguments)
                         if hasattr(checkpointer, "save_prototype_bank"):
                             checkpointer.save_prototype_bank("best_prototype_bank", **arguments)
+            synchronize()
+        if _prototype_requested(args):
+            if (
+                _should_initialize_prototypes_after_epoch(epoch, prototype_warmup_epochs)
+                and not _prototype_ready(model)
+            ):
+                maybe_initialize_prototypes(model, train_loader, args, device, logger)
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
         wandb_upload_best_checkpoints(
